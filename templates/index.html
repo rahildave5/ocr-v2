@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cheque Field Extractor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<div class="ledger">
+
+  <header class="masthead">
+    <div class="masthead-inner">
+      <span class="eyebrow">Spatial KIE &middot; PaddleOCR</span>
+      <h1>Cheque Field Extractor</h1>
+      <p class="sub">Drop a cheque image. It reads back Bank Name, Bank Address, Account No, and IFSC Code.</p>
+    </div>
+  </header>
+
+  <section class="dropzone-wrap">
+    <form id="upload-form">
+      <label id="dropzone" for="file-input" class="dropzone">
+        <div id="dz-idle" class="dz-state">
+          <svg class="dz-icon" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect x="4" y="10" width="40" height="28" rx="3" stroke="currentColor" stroke-width="2"/>
+            <path d="M4 16h40" stroke="currentColor" stroke-width="2"/>
+            <circle cx="10" cy="13" r="1.2" fill="currentColor"/>
+            <path d="M14 30l6-7 5 5 6-8 9 10" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+          </svg>
+          <p class="dz-title">Drop cheque image, or click to browse</p>
+          <p class="dz-hint">JPG · PNG · BMP · TIFF, up to 16&nbsp;MB</p>
+        </div>
+        <div id="dz-preview" class="dz-state" hidden>
+          <img id="preview-img" alt="Selected cheque preview">
+          <p id="preview-name" class="dz-filename"></p>
+        </div>
+      </label>
+      <input id="file-input" type="file" accept=".jpg,.jpeg,.png,.bmp,.tiff,.tif" hidden>
+    </form>
+    <button id="run-btn" class="run-btn" disabled>Extract fields</button>
+  </section>
+
+  <section id="status" class="status" hidden></section>
+
+  <section id="results" class="results" hidden>
+  <div class="results-head">
+    <div class="results-head-top">
+      <span class="eyebrow">Extracted Fields</span>
+      <button id="copy-btn" class="copy-btn" type="button">Copy as JSON</button>
+    </div>
+    <div class="rule"></div>
+  </div>
+  <div id="field-rows"></div>
+  <div id="missing-banner" class="missing-banner" hidden></div>
+  </section>
+
+  <section id="debug-wrap" class="debug-wrap" hidden>
+    <details id="debug-details">
+      <summary>Debug: raw OCR output &amp; merged lines</summary>
+      <pre id="debug-json"></pre>
+    </details>
+  </section>
+
+</div>
+
+<script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
