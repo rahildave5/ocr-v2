@@ -4,28 +4,63 @@ import re
 import os
 from paddleocr import PaddleOCR
 
-# Disable oneDNN to prevent crashes on CPU
-os.environ['PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT'] = '0'
-os.environ['FLAGS_use_onednn'] = '0'
-os.environ['FLAGS_use_mkldnn'] = '0'
 
-# Devanagari Unicode block (Hindi and other Indic scripts sharing it)
 DEVANAGARI_RE = re.compile(r'[\u0900-\u097F]')
 
 
 class ChequeOCR:
-    def __init__(self):
-        # Initialize PaddleOCR with English language and disabled MKLDNN/oneDNN
-        self.ocr = PaddleOCR(lang='en', enable_mkldnn=False)
+    def __init__(self, det_limit_side_len=1920):
+        # det_limit_side_len must be >= run_ocr()'s max_dimension. Without
+        # this, PaddleOCR falls back to its own default detector resize
+        # limit (960px on the long side in recent PP-OCR builds) and
+        # silently shrinks every image to that before running detection -
+        # regardless of how high-res/clear the source photo is. Small
+        # print (IFSC code, account number) becomes sub-pixel and never
+        # gets detected. Setting det_limit_type='max' + an explicit
+        # det_limit_side_len makes the detector only downscale if the
+        # image is actually larger than what we've already prepared.
+        self.det_limit_side_len = det_limit_side_len
+        self.ocr = PaddleOCR(
+            lang='en',
+            # Disabled: on this deployment box, oneDNN throws
+            # NotImplementedError (ConvertPirAttribute2RuntimeAttribute
+            # not support pir::ArrayAttribute<pir::DoubleAttribute>)
+            # inside the text-detection conv op. This is a real
+            # oneDNN/PaddleX PIR incompatibility, not something to tune
+            # around - confirmed by testing, not just a cautious guess.
+            # Leave this off unless/until you upgrade paddlepaddle and
+            # verify the crash is gone.
+            enable_mkldnn=False,
+            # os.cpu_count() instead of a hardcoded 8 so this doesn't
+            # over-subscribe (and thrash on context-switching) if this
+            # ever runs in a smaller 2-4 vCPU container.
+            cpu_threads=os.cpu_count() or 4,
+            # Restores rotation handling cheaply. PaddleOCR's built-in
+            # orientation classifier catches sideways/upside-down cheque
+            # photos (0/90/180/270 deg). This is required because the
+            # manual deskew in preprocess_image() below only corrects
+            # fine tilt (<15 deg) - it cannot fix a gross rotation, and
+            # there is no other rotation handling left in this file.
+            use_angle_cls=True,
+            # Brought back down from 0.75 to PaddleOCR's normal default.
+            # 0.75 is faster but silently drops faint/faded ink boxes
+            # (signatures, stamps, low-contrast print) below threshold -
+            # not misread, just never detected. Validate against a batch
+            # of your worst real cheque photos before raising this again.
+            det_db_box_thresh=0.6,
+            # See comment on self.det_limit_side_len above: without these
+            # two, PaddleOCR's own default resize limit undoes any
+            # resolution we preserved upstream and is the #1 cause of
+            # "clear image, but fields still not detected".
+            det_limit_side_len=det_limit_side_len,
+            det_limit_type='max',
+        )
         self.non_field_keywords = [
             'pay', 'bearer', 'rupees', 'order', 'valid for', 'a/c no', 'account no',
             'signature', 'please sign', 'or bearer',
-            # Handwritten overlays / stamps that can land anywhere on the cheque and
-            # should never be mistaken for a printed field (bank name, address, etc).
             'cancelled', 'cancel', 'void', 'specimen', 'sample', 'not negotiable',
             'not valid', 'duplicate', 'copy', 'draft'
         ]
-        # Regex patterns
         self.ifsc_pattern = re.compile(r'^[A-Z]{4}0[A-Z0-9]{6}$')
         self.account_pattern = re.compile(r'^\d{9,18}$')
 
@@ -61,7 +96,6 @@ class ChequeOCR:
         return any(token in t for token in self.known_bank_tokens)
 
     def _looks_like_person_name(self, text: str) -> bool:
-        """Detect payee / account-holder names that must never become bank_name."""
         t = text.strip()
         if not t or self._has_bank_evidence(t):
             return False
@@ -95,7 +129,6 @@ class ChequeOCR:
         return normalized in self.annotation_labels
 
     def _is_overlay_mark(self, text: str) -> bool:
-        """Detect CANCELLED / VOID and common OCR misspellings (e.g. camcelled)."""
         text_l = text.lower()
         direct_keywords = [
             'cancel', 'cancelled', 'void', 'specimen', 'sample',
@@ -112,8 +145,23 @@ class ChequeOCR:
             return True
         return False
 
+    def is_cancelled(self, extracted) -> bool:
+        cancel_keywords = ('cancelled', 'cancel', 'void')
+        for item in extracted:
+            text = item.get("text", "")
+            text_l = text.lower()
+            if any(kw in text_l for kw in cancel_keywords):
+                return True
+            cleaned = self._normalize_alpha(text)
+            if len(cleaned) < 5:
+                continue
+            if cleaned.startswith('canc') and cleaned.endswith(('led', 'lled', 'ed')):
+                return True
+            if 'camcel' in cleaned or 'cancell' in cleaned or 'cancl' in cleaned:
+                return True
+        return False
+
     def detect_annotated_upload(self, extracted) -> bool:
-        """True when OCR reads Streamlit overlay labels baked into the image."""
         hits = sum(
             1 for item in extracted
             if self._is_annotation_label(item.get("text", ""))
@@ -121,7 +169,6 @@ class ChequeOCR:
         return hits >= 2
 
     def _is_repetitive(self, text: str, min_repeats=3) -> bool:
-    # Use re.findall to extract words only, ignoring standalone punctuation like colons
         tokens = [t.lower() for t in re.findall(r'\b\w+\b', text)]
         if len(tokens) < min_repeats * 2:
             return False
@@ -142,34 +189,41 @@ class ChequeOCR:
                         seen.add(variant)
                         yield variant
 
+    def _has_foreign_long_digit_run(self, text: str, code: str, min_run: int = 9) -> bool:
+        """True if `text` contains a digit run of min_run+ characters that
+        isn't part of the matched IFSC code itself. A real IFSC line never
+        contains a run this long (its own digits are at most 6-7 chars);
+        account numbers are 9-18 digits. This catches the case where OCR
+        merges an 'A/c No.' label with the adjacent account-number digits
+        into one line/box, which can coincidentally match the IFSC regex
+        (4 letters + 0/O + alnum) purely from misread label characters."""
+        for run in re.findall(r'\d+', text):
+            if len(run) >= min_run and run not in code:
+                return True
+        return False
+
     def try_match_ifsc(self, raw: str):
         if not raw:
             return None
 
-        # Clean string to uppercase alphanumeric characters only
-        cleaned = re.sub(r'[^A-Za-z0-9]', '', raw).upper()
-
-        # 1. Global Label Destruction: Erase these words anywhere in the string 
-        # so OCR merging (e.g., 'IFSCC0DE') can NEVER create overlapping false matches.
-        cleaned_stripped = re.sub(r'(RTGS|NEFT|IFSC|IFS|C0DE|CODE)', '', cleaned)
-
-        # 2. Search Pattern: 4 letters + 0/O + 5 to 6 alphanumeric chars
-        # (Relaxed to 5-6 trailing chars to catch the 10-char typo on this dummy cheque)
         search_pattern = re.compile(r'[A-Z]{4}[0O][A-Z0-9]{5,6}')
 
-        # Try stripped version first, fallback to original if needed
-        for target in (cleaned_stripped, cleaned):
-            match = search_pattern.search(target)
-            if match:
+        for candidate in self._ifsc_candidates(raw):
+            cleaned_stripped = re.sub(r'(RTGS|NEFT|IFSC|IFS|C0DE|CODE)', '', candidate)
+            for target in (cleaned_stripped, candidate):
+                match = search_pattern.search(target)
+                if not match:
+                    continue
                 found = match.group(0)
-                # Normalize the 5th character to a numeric '0'
                 ifsc_code = found[:4] + '0' + found[5:]
+                tail = ifsc_code[5:]
+                if sum(c.isdigit() for c in tail) < 4:
+                    continue
                 return ifsc_code
 
         return None
 
     def _ifsc_token_bbox(self, ifsc_code, source):
-        """Narrow bbox to the OCR token that actually contains the IFSC code."""
         members = source.get("members") or [source]
         for member in members:
             if self.try_match_ifsc(member.get("text", "")) == ifsc_code:
@@ -178,12 +232,6 @@ class ChequeOCR:
             if ifsc_code in tight:
                 return member["bbox"]
 
-        # Fallback: locate which member token the match actually falls inside by
-        # walking members in x-order and tracking cumulative cleaned-text offsets,
-        # then use THAT member's own bbox/width to interpolate. Do not interpolate
-        # over the whole merged line's bbox using a single uniform char width —
-        # on a line that mixes an address (wide, sparse) with a short code, that
-        # assumption misplaces the box entirely (correct text, wrong crop).
         text = source.get("text", "")
         cleaned = re.sub(r'[^A-Za-z0-9]', '', text).upper()
         idx = cleaned.find(ifsc_code)
@@ -205,9 +253,6 @@ class ChequeOCR:
                     tx1 = min(tx0 + len(ifsc_code) * char_w, x1)
                     return [[tx0, y0], [tx1, y0], [tx1, y1], [tx0, y1]]
                 offset += m_len
-            # No single member covers the whole match (code was split across
-            # member boundaries) — union just the members whose ranges overlap
-            # the match span, instead of the entire line.
             overlap_bboxes = []
             offset = 0
             for member in members_sorted:
@@ -224,34 +269,22 @@ class ChequeOCR:
 
     def _clean_bank_name(self, text: str) -> str:
         t = text
-        # Strip IFSC and SWIFT codes
         t = re.sub(r'IFS?C?\s*CODE\s*[:\-]?\s*[A-Z]{4}0[A-Z0-9]{6}', ' ', t, flags=re.IGNORECASE)
         t = re.sub(r'\b[A-Z]{4}0[A-Z0-9]{6}\b', ' ', t)
         t = re.sub(r'SWIFT\s*:?', ' ', t, flags=re.IGNORECASE)
-        
-        # Strip branch codes like (09164) and 6-digit pincodes
         t = re.sub(r'\(\d{4,5}\)[^,]*', ' ', t)
         t = re.sub(r'\b\d{6}\b', ' ', t)
-        
-        # Strip trailing address words if merged
         address_kw_pattern = r'\b(branch|road|marg|street|nagar|dist|district|vpo|teh|tehsil|near|opp|pin|pincode|tel|fax|gujrat|gujarat)\b.*'
         t = re.sub(address_kw_pattern, ' ', t, flags=re.IGNORECASE)
-        
         t = re.sub(r'[^A-Za-z0-9\s\.\'-]', ' ', t)
         t = ' '.join(t.split())
-        
         if 'bank' in t.lower():
             m = re.search(r'([A-Za-z][\w\s\.\'-]*bank[\w\s\.\'-]*)', t, re.IGNORECASE)
             if m:
                 return m.group(1).strip()
         return t.strip()
-    # ---------- Devanagari / non-English filtering ----------
 
     def _strip_devanagari(self, text: str) -> str:
-        """Drop any whitespace-separated token containing Devanagari script chars,
-        keep the rest in original order. Used so mixed English/Hindi OCR lines
-        (e.g. 'Faithful SyndicateBank, ... HYDERABAD - 500001') never leak the
-        Hindi portion into a returned field value."""
         if not text:
             return text
         tokens = text.split()
@@ -264,10 +297,22 @@ class ChequeOCR:
         hits = len(DEVANAGARI_RE.findall(text))
         return hits > len(text) * ratio
 
-    # ----------------------------------------------------------
+    def _is_probable_garbage(self, text: str, confidence: float = 1.0, conf_thresh: float = 0.55) -> bool:
+        t = text.strip()
+        if not t:
+            return True
+        if DEVANAGARI_RE.search(t):
+            return False
+        if re.search(r'[^\x00-\x7F]', t):
+            return True
+        letters = [c for c in t if c.isalpha()]
+        if len(letters) >= 4:
+            vowel_ratio = sum(1 for c in letters if c.lower() in 'aeiou') / len(letters)
+            if vowel_ratio < 0.12 and confidence < conf_thresh:
+                return True
+        return False
 
     def _bank_name_parts_from_block(self, block):
-        """Text and bbox from the same bank-name tokens so crop matches extracted text."""
         texts = []
         xs, ys = [], []
         for line in block:
@@ -275,6 +320,8 @@ class ChequeOCR:
                 txt = member.get("text", "")
                 txt_l = txt.lower()
                 if self._is_annotation_label(txt) or self._is_overlay_mark(txt):
+                    continue
+                if self._is_probable_garbage(txt, member.get("confidence", 1.0)):
                     continue
                 if self.is_address(txt) or self.try_match_ifsc(txt):
                     continue
@@ -297,20 +344,12 @@ class ChequeOCR:
         return bbox
 
     def _watermark_bank_fallback(self, extracted):
-        """Last-resort bank-name source for cheque crops that don't include the
-        printed header/logo at all. Many cheques carry a repeating security
-        watermark microprint along the page (e.g. "...AXIS BANK LTD AXIS BANK
-        LTD AXIS BANK LTD...") — if that's the only text mentioning "bank" and
-        it genuinely repeats several times, treat one repeat as the bank name.
-        Returns a dict with a TIGHT bbox around a single occurrence (not the
-        whole smeared watermark strip), or None if no real repeat exists (so a
-        one-off stray mention of "bank" elsewhere is never misused)."""
         bank_tokens = [
             it for it in extracted
             if "bank" in it["text"].lower() and not self._is_annotation_label(it["text"])
         ]
         if len(bank_tokens) < 3:
-            return None  # not a repeating watermark, just a stray mention
+            return None
 
         bank_tokens.sort(key=lambda it: (self._row_center(it), self._bbox_left(it["bbox"])))
         anchor = bank_tokens[0]
@@ -327,9 +366,6 @@ class ChequeOCR:
         if anchor_idx is None:
             window = [anchor]
         else:
-            # One neighbor token on each side is enough to capture a typical
-            # "<name> BANK <suffix>" repeat unit without pulling in the next
-            # cycle of the watermark.
             window = same_row[max(0, anchor_idx - 1):anchor_idx + 2]
         if not window:
             return None
@@ -355,16 +391,13 @@ class ChequeOCR:
             return False
         if self._is_repetitive(text) or any(kw in text_lower for kw in self.non_field_keywords):
             return False
-        # NEW: reject date-grid / validity boilerplate that otherwise satisfies the
-        # comma+digits or keyword heuristics below (e.g. "D D M M Y Y Y Y",
-        # "VALID FOR 3 MONTHS ONLY", "NOT FOR CASH TRANSACTION ONLY").
         grid_keywords = ['valid for', 'months only', 'cash transaction', 'd d m m', 'y y y y']
         if any(kw in text_lower for kw in grid_keywords):
             return False
         letters = sum(c.isalpha() for c in text)
         digits = sum(c.isdigit() for c in text)
         if digits > 0 and letters == 0:
-            return False  # pure digit/letter grids like "D D M M Y Y Y Y" strip to nothing useful
+            return False
         if re.search(r'\b\d{6}\b', text) or re.search(r'\b\d{3}\s\d{3}\b', text):
             return True
         keywords = [
@@ -382,8 +415,84 @@ class ChequeOCR:
             return True
         return False
 
-    def preprocess_image(self, img):
+    def _order_points(self, pts):
+        pts = pts.reshape(4, 2).astype("float32")
+        rect = np.zeros((4, 2), dtype="float32")
+        s = pts.sum(axis=1)
+        rect[0] = pts[np.argmin(s)]
+        rect[2] = pts[np.argmax(s)]
+        diff = np.diff(pts, axis=1)
+        rect[1] = pts[np.argmin(diff)]
+        rect[3] = pts[np.argmax(diff)]
+        return rect
+
+    def auto_perspective_correct(self, img, min_area_ratio=0.2):
+        h, w = img.shape[:2]
+        img_area = h * w
+        if img_area == 0:
+            return img, False
+
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        edged = cv2.Canny(blurred, 50, 150)
+        edged = cv2.dilate(edged, np.ones((3, 3), np.uint8), iterations=1)
+
+        contours, _ = cv2.findContours(edged, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return img, False
+
+        doc_cnt = None
+        for c in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
+            area = cv2.contourArea(c)
+            if area < img_area * min_area_ratio:
+                break
+            peri = cv2.arcLength(c, True)
+            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+            if len(approx) == 4 and cv2.isContourConvex(approx):
+                # Sanity check: a cheque's aspect ratio is roughly 2:1-2.6:1.
+                # Without this, a false-positive quad from background clutter
+                # (a table edge, a folder, a shadow) can pass the area/shape
+                # checks and get warped as if it were the cheque - silently
+                # wrecking an otherwise perfectly clear photo before OCR ever
+                # runs. This is the most common cause of "clear image, still
+                # nothing detected".
+                rect = self._order_points(approx)
+                (tl, tr, br, bl) = rect
+                cand_w = max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl))
+                cand_h = max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl))
+                if cand_h == 0:
+                    continue
+                ar = cand_w / cand_h
+                if not (1.6 <= ar <= 3.0):
+                    continue
+                doc_cnt = approx
+                break
+
+        if doc_cnt is None:
+            return img, False
+
+        rect = self._order_points(doc_cnt)
+        (tl, tr, br, bl) = rect
+        max_width = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
+        max_height = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
+        if max_width < 50 or max_height < 50:
+            return img, False
+
+        dst = np.array([
+            [0, 0], [max_width - 1, 0],
+            [max_width - 1, max_height - 1], [0, max_height - 1],
+        ], dtype="float32")
+
+        M = cv2.getPerspectiveTransform(rect, dst)
+        warped = cv2.warpPerspective(img, M, (max_width, max_height))
+        return warped, True
+
+    def preprocess_image(self, img):
+        img, perspective_applied = self.auto_perspective_correct(img)
+        rotated_img = img.copy()
+        detected_angle = 0
+
+        gray = cv2.cvtColor(rotated_img, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
 
@@ -393,26 +502,30 @@ class ChequeOCR:
             angle = rect[-1]
             if angle > 45:
                 angle = angle - 90
-            if abs(angle) < 15:
-                (h, w) = img.shape[:2]
+            # Raised from 15 to 45 deg: real-world phone photos of cheques
+            # are often shot at a deliberate angle rather than flat, and a
+            # 15 deg cap left that print diagonal going into OCR, which
+            # also breaks the position-based field heuristics downstream
+            # (they assume roughly horizontal text). Gross 90/180/270 deg
+            # rotation is still left to PaddleOCR's own orientation
+            # classifier (use_angle_cls=True, set in __init__).
+            if abs(angle) < 45:
+                (h, w) = rotated_img.shape[:2]
                 center = (w // 2, h // 2)
                 M = cv2.getRotationMatrix2D(center, angle, 1.0)
-                rotated_img = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-            else:
-                rotated_img = img.copy()
-        else:
-            rotated_img = img.copy()
+                rotated_img = cv2.warpAffine(rotated_img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+                detected_angle = angle
 
         gray_rotated = cv2.cvtColor(rotated_img, cv2.COLOR_BGR2GRAY)
-        denoised = cv2.fastNlMeansDenoising(gray_rotated, h=10)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced_gray = clahe.apply(denoised)
 
-        processed_ocr_img = cv2.cvtColor(enhanced_gray, cv2.COLOR_GRAY2BGR)
-        return rotated_img, processed_ocr_img
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        contrast_enhanced = clahe.apply(gray_rotated)
+        denoised = cv2.bilateralFilter(contrast_enhanced, 9, 75, 75)
+        processed_ocr_img = cv2.cvtColor(denoised, cv2.COLOR_GRAY2BGR)
+
+        return rotated_img, processed_ocr_img, detected_angle, perspective_applied
 
     def _bbox_rect(self, bbox):
-        """Axis-aligned bounds from a PaddleOCR quadrilateral (point order agnostic)."""
         xs = [p[0] for p in bbox]
         ys = [p[1] for p in bbox]
         return min(xs), min(ys), max(xs), max(ys)
@@ -501,6 +614,7 @@ class ChequeOCR:
             if self._row_center(l) / img_height < 0.30
             and not self._is_overlay_mark(l["text"])
             and not self._is_annotation_label(l["text"])
+            and not self._is_probable_garbage(l["text"], l["confidence"])
         ]
         candidates.sort(key=self._row_center)
         blocks = []
@@ -530,53 +644,58 @@ class ChequeOCR:
             results.append({"text": text, "bbox": bbox, "confidence": conf})
         return results
 
-    def _extract_address_by_geometry(self, lines, bank_bbox, ifsc_bbox, width_est, pad_ratio=0.15, x_limit_ratio=0.62):
-        """Geometric address detector: catches lines that fail is_address()'s keyword
-    checks (e.g. OCR misreads 'ROAD' as 'RAOD') as long as they sit in the band
-    between the bottom of the bank-name block and the top of the IFSC line, in
-    the left header column. Falls back to None if either anchor is missing,
-    letting the existing keyword-based scan run instead."""
+    def _extract_address_by_geometry(self, lines, bank_bbox, ifsc_bbox, width_est, pad_ratio=0.35, x_limit_ratio=0.62):
         if not bank_bbox or not ifsc_bbox:
             return None
 
-    _, bank_top, _, bank_bottom = self._bbox_rect(bank_bbox)
-    ifsc_left, ifsc_top, _, _ = self._bbox_rect(ifsc_bbox)
-    if ifsc_top <= bank_bottom:
-        return None  # anchors out of order / overlapping, don't trust the band
+        _, bank_top, _, bank_bottom = self._bbox_rect(bank_bbox)
+        ifsc_left, ifsc_top, _, _ = self._bbox_rect(ifsc_bbox)
+        if ifsc_top <= bank_bottom:
+            return None
 
-    band_height = max(ifsc_top - bank_bottom, 1)
-    pad = band_height * pad_ratio
-    y_start = bank_bottom - pad
-    y_end = ifsc_top + pad
-    x_limit = width_est * x_limit_ratio  # stay left, skip the "valid for 3 months" date grid
+        band_height = max(ifsc_top - bank_bottom, 1)
+        pad = band_height * pad_ratio
+        y_start = bank_bottom - pad
+        y_end = ifsc_top + pad
+        x_limit = width_est * x_limit_ratio
 
-    candidates = []
-    for line in lines:
-        txt = line["text"].strip()
-        if not txt:
-            continue
-        if self._is_overlay_mark(txt) or self._is_annotation_label(txt):
-            continue
-        if any(kw in txt.lower() for kw in self.non_field_keywords):
-            continue
-        if self.try_match_ifsc(txt):
-            continue
-        cy = self._row_center(line)
-        cx = self._bbox_left(line["bbox"])
-        if not (y_start <= cy <= y_end) or cx > x_limit:
-            continue
-        candidates.append(line)
+        candidates = []
+        for line in lines:
+            raw_txt = line["text"].strip()
+            if not raw_txt:
+                continue
+            if self._is_overlay_mark(raw_txt) or self._is_annotation_label(raw_txt):
+                continue
+            if self._is_probable_garbage(raw_txt, line["confidence"]):
+                continue
+            if any(kw in raw_txt.lower() for kw in self.non_field_keywords):
+                continue
 
-    if not candidates:
-        return None
+            txt = raw_txt
+            if self.try_match_ifsc(raw_txt):
+                stripped = re.sub(r'IFS?C?\s*:?\s*[A-Z0-9]{6,11}', '', raw_txt, flags=re.IGNORECASE)
+                stripped = re.sub(r'SWIFT\s*:?\s*[A-Z0-9]*', '', stripped, flags=re.IGNORECASE)
+                stripped = stripped.strip(' :,-')
+                if len(stripped) < 5:
+                    continue
+                txt = stripped
 
-    candidates.sort(key=self._row_center)
-    text = ", ".join(c["text"].strip() for c in candidates if c["text"].strip())
-    xs = [p[0] for c in candidates for p in c["bbox"]]
-    ys = [p[1] for c in candidates for p in c["bbox"]]
-    bbox = [[min(xs), min(ys)], [max(xs), min(ys)], [max(xs), max(ys)], [min(xs), max(ys)]]
-    conf = sum(c["confidence"] for c in candidates) / len(candidates)
-    return {"text": text, "bbox": bbox, "confidence": conf}
+            cy = self._row_center(line)
+            cx = self._bbox_left(line["bbox"])
+            if not (y_start <= cy <= y_end) or cx > x_limit:
+                continue
+            candidates.append({**line, "text": txt})
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=self._row_center)
+        text = ", ".join(c["text"].strip() for c in candidates if c["text"].strip())
+        xs = [p[0] for c in candidates for p in c["bbox"]]
+        ys = [p[1] for c in candidates for p in c["bbox"]]
+        bbox = [[min(xs), min(ys)], [max(xs), min(ys)], [max(xs), max(ys)], [min(xs), max(ys)]]
+        conf = sum(c["confidence"] for c in candidates) / len(candidates)
+        return {"text": text, "bbox": bbox, "confidence": conf}
 
     def merge_header_block(self, lines, img_height, max_gap_ratio=0.10, y_limit=0.25,
                             height_ratio_thresh=0.55):
@@ -589,7 +708,8 @@ class ChequeOCR:
             and self._bbox_left(l["bbox"]) / width_est < x_limit
             and not self._is_annotation_label(l["text"])
             and not self._is_overlay_mark(l["text"])
-            and (not self.is_address(l["text"]) or self._has_bank_evidence(l["text"]))            
+            and not self._is_probable_garbage(l["text"], l["confidence"])
+            and (not self.is_address(l["text"]) or self._has_bank_evidence(l["text"]))
             and not self.try_match_ifsc(l["text"])
             and not self.branch_code_re.search(l["text"])
             and not self._looks_like_person_name(l["text"])
@@ -600,15 +720,6 @@ class ChequeOCR:
             return None, []
         candidates = bankish
 
-        # Anchor on the tallest candidate. Printed bank names are almost always
-        # the largest text near the top of a cheque; small-font mascot captions
-        # or taglines (e.g. a Hindi tagline that an English-only OCR model
-        # garbles into fake Latin letters, or even a genuine English tagline
-        # like "Faithful") sit at a fraction of that height and must not get
-        # glued onto the bank name just because they happen to be nearby — the
-        # old logic accepted ANY short alphabetic word as a "continuation",
-        # which is how junk like "Paearifta Faithful" ended up prefixed onto
-        # "SyndicateBank".
         anchor = max(candidates, key=self._row_height)
         anchor_height = max(self._row_height(anchor), 1)
 
@@ -642,13 +753,46 @@ class ChequeOCR:
         conf = sum(b["confidence"] for b in block) / len(block)
         return {"text": text, "bbox": bbox, "confidence": conf}, block
 
-    def run_ocr(self, img):
-        predictions = list(self.ocr.predict(img))
+    def run_ocr(self, img, max_dimension=None, min_dimension=1600):
+        # Default to self.det_limit_side_len (see __init__) instead of a
+        # hardcoded value, so this pre-resize and PaddleOCR's own internal
+        # detector limit always agree - one no longer silently undoes the
+        # other.
+        if max_dimension is None:
+            max_dimension = self.det_limit_side_len
+
+        h, w = img.shape[:2]
+        longest_side = max(h, w)
+        scale = 1.0
+        ocr_img = img
+        if longest_side > max_dimension:
+            scale = max_dimension / float(longest_side)
+            new_w = max(int(round(w * scale)), 1)
+            new_h = max(int(round(h * scale)), 1)
+            ocr_img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        elif longest_side < min_dimension:
+            # Upscale floor: this pipeline only ever downscaled before, so
+            # a modest-resolution photo (a typical phone shot well under
+            # ~1600px, like a cheque held at arm's length rather than
+            # macro-photographed) went into the detector at native size
+            # with no help. Fine print (IFSC, account no.) at that size can
+            # be only a few pixels tall - too small for reliable detection
+            # regardless of how "clear"/in-focus the source shot is.
+            # INTER_CUBIC gives smoother edges for the detector than a
+            # plain nearest/linear upscale.
+            scale = min_dimension / float(longest_side)
+            new_w = max(int(round(w * scale)), 1)
+            new_h = max(int(round(h * scale)), 1)
+            ocr_img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+
+        predictions = list(self.ocr.predict(ocr_img))
         extracted = []
         for res in predictions:
             if 'rec_texts' in res:
                 for text, bbox_arr, score in zip(res['rec_texts'], res['rec_polys'], res['rec_scores']):
                     bbox = bbox_arr.tolist()
+                    if scale != 1.0:
+                        bbox = [[x / scale, y / scale] for x, y in bbox]
                     clean_text = text.strip()
                     if clean_text:
                         extracted.append({
@@ -659,11 +803,6 @@ class ChequeOCR:
         return extracted
 
     def _overlay_exclusion_zones(self, extracted):
-        """Bounding boxes of handwritten overlay marks (CANCELLED, VOID, SPECIMEN,
-        etc). These must never contribute to ANY field — not just the field they
-        happen to resemble — because OCR can misread cursive strokes as spurious
-        digits or letters that coincidentally satisfy a totally unrelated field's
-        pattern (e.g. a garbled digit run matching the account-number regex)."""
         zones = []
         for item in extracted:
             if self._is_overlay_mark(item["text"]) or self._is_annotation_label(item["text"]):
@@ -688,12 +827,75 @@ class ChequeOCR:
                     return True
         return False
 
+    def _looks_like_payer_name_text(self, text: str) -> bool:
+        t = text.strip()
+        if not t:
+            return False
+        tl = t.lower()
+        block_kw = ('rupees', 'signature', 'valid for', 'a/c', 'account',
+                    'ifsc', 'branch', 'cheque', 'chq', 'date', 'dd mm yyyy')
+        if any(kw in tl for kw in block_kw):
+            return False
+        if self._is_overlay_mark(t) or self._is_annotation_label(t):
+            return False
+        return True
+
+    def extract_payer_name(self, extracted, img_height):
+        pay_anchor = None
+        for item in extracted:
+            t = item["text"].strip().lower().rstrip(':')
+            if t != 'pay':
+                continue
+            y_ratio = self._row_center(item) / img_height if img_height else 0
+            if y_ratio > 0.6:
+                continue
+            if pay_anchor is None or self._row_center(item) < self._row_center(pay_anchor):
+                pay_anchor = item
+
+        if pay_anchor is None:
+            return None
+
+        anchor_y = self._row_center(pay_anchor)
+        anchor_h = max(self._row_height(pay_anchor), 1)
+        anchor_right = self._bbox_rect(pay_anchor["bbox"])[2]
+
+        same_row = [
+            it for it in extracted
+            if it is not pay_anchor
+            and abs(self._row_center(it) - anchor_y) < anchor_h * 1.1
+            and self._bbox_left(it["bbox"]) >= anchor_right - anchor_h * 0.5
+        ]
+        same_row.sort(key=lambda it: self._bbox_left(it["bbox"]))
+
+        name_parts = []
+        for it in same_row:
+            t = it["text"].strip()
+            tl = t.lower()
+            if re.match(r'^or\b', tl) or 'bearer' in tl or re.search(r'\border\b', tl):
+                break
+            if not self._looks_like_payer_name_text(t):
+                continue
+            name_parts.append(it)
+
+        if not name_parts:
+            return None
+
+        text = " ".join(p["text"].strip() for p in name_parts).strip(' .:-')
+        if not text:
+            return None
+        xs = [p[0] for it in name_parts for p in it["bbox"]]
+        ys = [p[1] for it in name_parts for p in it["bbox"]]
+        bbox = [[min(xs), min(ys)], [max(xs), min(ys)], [max(xs), max(ys)], [min(xs), max(ys)]]
+        conf = sum(it["confidence"] for it in name_parts) / len(name_parts)
+        return {"text": text, "bbox": bbox, "confidence": conf}
+
     def classify_and_extract(self, extracted, img_height):
-        # 1. Calculate image bounding bounds early so x_ratio calculations don't fail
+        cancelled = self.is_cancelled(extracted)
+
         exclusion_zones = self._overlay_exclusion_zones(extracted)
         extracted = [it for it in extracted if not self._in_exclusion_zone(it["bbox"], exclusion_zones)]
         lines = self.merge_same_line(extracted)
-        
+
         all_xs = [p[0] for it in extracted for p in it["bbox"]] if extracted else [1]
         width_est = max(all_xs) if all_xs else 1
         best = {}
@@ -703,13 +905,17 @@ class ChequeOCR:
                 best[field_type] = {"text": text, "bbox": bbox, "confidence": confidence, "field_type": field_type}
 
         def consider_ifsc(source, confidence):
-            cand = self.try_match_ifsc(source.get("text_tight", source.get("text", ""))) or self.try_match_ifsc(source["text"])
+            raw = source.get("text_tight", source.get("text", ""))
+            cand = self.try_match_ifsc(raw) or self.try_match_ifsc(source["text"])
             if not cand:
+                return
+            if any(kw in source["text"].lower() for kw in ('a/c', 'a c no', 'acc no', 'account no')):
+                return
+            if self._has_foreign_long_digit_run(raw, cand) or self._has_foreign_long_digit_run(source["text"], cand):
                 return
             bbox = self._ifsc_token_bbox(cand, source)
             consider("ifsc_code", cand, bbox, confidence)
 
-        # --- 1. IFSC Extraction
         anchor_re = re.compile(r'IFS|SWIFT', re.IGNORECASE)
         for item in extracted:
             if anchor_re.search(item["text"]):
@@ -726,7 +932,6 @@ class ChequeOCR:
                 if self.try_match_ifsc(line.get("text_tight", line["text"])):
                     consider_ifsc(line, line["confidence"])
 
-        # --- 2. Account Number Extraction
         account_candidates = []
         def add_account_candidate(digits_only, bbox, confidence, y_ratio):
             if self.account_pattern.match(digits_only) and 0.15 < y_ratio < 0.90:
@@ -750,12 +955,11 @@ class ChequeOCR:
             top_cand = account_candidates[0]
             consider("account_no", top_cand["text"], top_cand["bbox"], top_cand["confidence"])
 
-        # --- 3. Position-Agnostic Bank Name Extraction
-        # --- 3. Strict Position-Agnostic Bank Name Extraction
         bank_candidates = []
-        # Must explicitly contain one of these to be recognized as a bank
         valid_bank_keywords = ['bank', 'sbi', 'hdfc', 'icici', 'axis', 'kotak', 'punjab', 'syndicate', 'baroda', 'canara', 'maharashtra', 'union', 'indian']
-        
+
+
+
         for line in lines:
             txt = line["text"].strip()
             txt_l = txt.lower()
@@ -764,7 +968,6 @@ class ChequeOCR:
                 continue
             if any(kw in txt_l for kw in self.non_field_keywords):
                 continue
-            # Explicitly block company/account holder names
             if "private limited" in txt_l or "pvt ltd" in txt_l:
                 continue
             if self._looks_like_person_name(txt):
@@ -781,13 +984,12 @@ class ChequeOCR:
                 if bank_members:
                     combined_txt = " ".join(m["text"] for m in bank_members)
                     cleaned = self._clean_bank_name(combined_txt)
-                    
-                    # STRICT CHECK: Must contain a valid bank keyword
+
                     if cleaned and any(bk in cleaned.lower() for bk in valid_bank_keywords):
                         xs = [p[0] for m in bank_members for p in m["bbox"]]
                         ys = [p[1] for m in bank_members for p in m["bbox"]]
                         tight_bbox = [[min(xs), min(ys)], [max(xs), min(ys)], [max(xs), max(ys)], [min(xs), max(ys)]]
-                        
+
                         avg_conf = sum(m["confidence"] for m in bank_members) / len(bank_members)
                         bank_candidates.append({
                             "text": cleaned,
@@ -799,15 +1001,27 @@ class ChequeOCR:
             best_bank = max(bank_candidates, key=lambda x: x["confidence"])
             consider("bank_name", best_bank["text"], best_bank["bbox"], best_bank["confidence"] + 0.5)
 
-        # --- 4. Smart Bank Address Extraction & Cleanup
         ifsc_text = best.get("ifsc_code", {}).get("text", "")
+
+        geo_addr = self._extract_address_by_geometry(
+            lines,
+            best.get("bank_name", {}).get("bbox"),
+            best.get("ifsc_code", {}).get("bbox"),
+            width_est,
+        )
+        if geo_addr and geo_addr["text"]:
+            addr_text = geo_addr["text"]
+            addr_text = re.sub(r'IFS?C?\s*CODE\s*[:\-]?\s*[A-Z0-9]+', '', addr_text, flags=re.IGNORECASE)
+            addr_text = re.sub(r'SWIFT\s*:?\s*[A-Z0-9]*', '', addr_text, flags=re.IGNORECASE)
+            consider("bank_address", addr_text.strip(), geo_addr["bbox"], geo_addr["confidence"] + 0.3)
+
         remaining_lines = [
             l for l in lines
             if not self._is_overlay_mark(l["text"])
             and not self._is_annotation_label(l["text"])
             and l["text"] != ifsc_text
         ]
-        
+
         address_candidates = []
         for line in remaining_lines:
             txt = line["text"]
@@ -816,43 +1030,65 @@ class ChequeOCR:
                 continue
             if "private limited" in txt_l or "pvt ltd" in txt_l:
                 continue
+            if self._is_probable_garbage(txt, line["confidence"]):
+                continue
             if self.is_address(txt) or self.branch_code_re.search(txt):
                 address_candidates.append(line)
 
         if address_candidates:
-            # Sort to explicitly penalize purely Tel/Fax lines and prioritize physical locations
-            address_candidates.sort(
+            address_candidates.sort(key=self._row_center)
+            anchor = max(
+                address_candidates,
                 key=lambda b: (
                     re.search(r'\b\d{6}\b', b["text"]) is not None,
                     any(kw in b["text"].lower() for kw in ['dist', 'nagar', 'road', 'vpo', 'teh', 'marg', 'street']),
                     -1 if ("tel" in b["text"].lower() or "fax" in b["text"].lower()) else 0,
                     len(b["text"])
                 ),
-                reverse=True,
             )
-            
-            best_addr = address_candidates[0]
-            addr_text = best_addr["text"]
-            
-            # Clean up OCR hallucinations ("ta ia HH") and trailing IFSC/SWIFT gibberish
-            addr_text = re.sub(r'^([a-zA-Z]{1,2}\s+){1,4}', '', addr_text) # Strips leading short gibberish
+            anchor_y = self._row_center(anchor)
+            max_gap = max(self._row_height(anchor), 10) * 3.0
+            block = [
+                l for l in address_candidates
+                if abs(self._row_center(l) - anchor_y) <= max_gap
+                and not ("tel" in l["text"].lower() or "fax" in l["text"].lower())
+            ]
+            if not block:
+                block = [anchor]
+            block.sort(key=self._row_center)
+
+            addr_text = ", ".join(b["text"].strip() for b in block if b["text"].strip())
+            xs = [p[0] for b in block for p in b["bbox"]]
+            ys = [p[1] for b in block for p in b["bbox"]]
+            addr_bbox = [[min(xs), min(ys)], [max(xs), min(ys)], [max(xs), max(ys)], [min(xs), max(ys)]]
+            addr_conf = sum(b["confidence"] for b in block) / len(block)
+
+            addr_text = re.sub(r'^([a-zA-Z]{1,2}\s+){1,4}', '', addr_text)
             addr_text = re.sub(r'IFS?C?\s*CODE\s*[:\-]?\s*[A-Z0-9]+', '', addr_text, flags=re.IGNORECASE)
             addr_text = re.sub(r'SWIFT\s*:?\s*[A-Z0-9]*', '', addr_text, flags=re.IGNORECASE)
             addr_text = addr_text.strip()
-            
-            consider("bank_address", addr_text, best_addr["bbox"], best_addr["confidence"])
-        # --- 5. Strip Devanagari (Hindi/vernacular) tokens from text fields
+
+            consider("bank_address", addr_text, addr_bbox, addr_conf)
+
         for field_type in ("bank_name", "bank_address"):
             if field_type in best:
                 original = best[field_type]["text"]
                 cleaned = self._strip_devanagari(original)
                 best[field_type]["text"] = cleaned if cleaned else original
 
-        return best
+        for key in best:
+            if "text" in best[key] and isinstance(best[key]["text"], str):
+                best[key]["text"] = best[key]["text"].upper()   
+
+        if not cancelled:
+            payer = self.extract_payer_name(extracted, img_height)
+            if payer and payer["text"]:
+                consider("payer_name", payer["text"], payer["bbox"], payer["confidence"])
+
+        return best, cancelled
 
     def crop_field(self, img, bbox, pad=2, expand_ratio=0.12, min_expand_px=4,
                    tight=False, tight_thresh=200, tight_pad=2):
-        """Axis-aligned crop from the detector bbox so x/y always match the ROI."""
         x0, y0, x1, y1 = self._bbox_rect(bbox)
         w_box = x1 - x0
         h_box = y1 - y0
@@ -880,8 +1116,6 @@ class ChequeOCR:
         return crop
 
     def _tight_trim(self, crop, thresh=200, pad=2):
-        """Trim blank margins off a crop so it starts right at the first ink
-        column/row instead of the raw (padded) detector bbox."""
         if crop is None or crop.size == 0:
             return crop
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
@@ -892,12 +1126,12 @@ class ChequeOCR:
         cols = np.where(col_sums > 0)[0]
         rows = np.where(row_sums > 0)[0]
         if len(cols) == 0 or len(rows) == 0:
-            return crop  # nothing detected as ink, leave crop untouched
+            return crop
 
         h, w = gray.shape[:2]
         x0 = max(int(cols[0]) - pad, 0)
         x1 = min(int(cols[-1]) + pad + 1, w)
-        y0 = max(int(rows[0]) - pad, 0)
+        y0 = max(int(rows[0]) - pad, 1)
         y1 = min(int(rows[-1]) + pad + 1, h)
 
         return crop[y0:y1, x0:x1]
