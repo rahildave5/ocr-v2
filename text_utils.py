@@ -1,4 +1,3 @@
-
 import re
 
 DEVANAGARI_RE = re.compile(r'[\u0900-\u097F]')
@@ -60,15 +59,31 @@ class TextUtilsMixin:
                         yield variant
 
     def _has_foreign_long_digit_run(self, text: str, code: str, min_run: int = 9) -> bool:
-        """True if `text` contains a digit run of min_run+ characters that
-        isn't part of the matched IFSC code itself. A real IFSC line never
-        contains a run this long (its own digits are at most 6-7 chars);
-        account numbers are 9-18 digits. This catches the case where OCR
-        merges an 'A/c No.' label with the adjacent account-number digits
-        into one line/box, which can coincidentally match the IFSC regex
-        (4 letters + 0/O + alnum) purely from misread label characters."""
-        for run in re.findall(r'\d+', text):
-            if len(run) >= min_run and run not in code:
+        """True if a digit run of min_run+ chars sits directly adjacent to
+        the matched IFSC code (touching it, no separator) and isn't part of
+        the code itself. This catches OCR merging an 'A/c No.' label with
+        the adjacent account-number digits into the same box/line as the
+        IFSC code. It deliberately does NOT scan the whole line: unrelated
+        long digit runs elsewhere on the line (e.g. a phone/fax number in
+        'Tel:1871267777 Fax:1267777 IFS CODE: SBIN0007756') are separated
+        from the code by other characters and must not reject an otherwise
+        valid IFSC match."""
+        cleaned = re.sub(r'[^A-Za-z0-9]', '', text).upper()
+        idx = cleaned.find(code)
+        if idx < 0:
+            # Code isn't findable verbatim (e.g. matched via a confusion-sub
+            # variant) - fall back to a whole-line scan as before, better to
+            # be cautious than to silently accept a bad match.
+            for run in re.findall(r'\d+', text):
+                if len(run) >= min_run and run not in code:
+                    return True
+            return False
+
+        code_end = idx + len(code)
+        before = cleaned[max(0, idx - min_run):idx]
+        after = cleaned[code_end:code_end + min_run]
+        for run in re.findall(r'\d+', before) + re.findall(r'\d+', after):
+            if len(run) >= min_run:
                 return True
         return False
 
