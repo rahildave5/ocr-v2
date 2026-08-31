@@ -1,4 +1,4 @@
-# Cheque Field Extractor
+# OCR + CV pipeline for Cheque Field Extractor
 
 A Flask app that reads Indian bank cheques and pulls out the fields you
 actually need — Bank Name, Branch Address, Account Number, IFSC Code, and
