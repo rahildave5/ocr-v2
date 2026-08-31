@@ -15,7 +15,7 @@ TARGET_FIELDS = ["bank_name", "bank_address", "account_no", "ifsc_code"]
 
 FIELD_LABELS = {
     "bank_name": "Bank Name",
-    "bank_address": "Bank Address",
+    "bank_address": "Branch Address",
     "account_no": "Account Number",
     "ifsc_code": "IFSC Code",
     "payer_name": "Payer Name",
