@@ -20,7 +20,7 @@ let selectedFile = null;
 
 const STAGE_LABELS = {
   preprocess: "Image Preprocessing",
-  ocr: "Running OCR... This could take 2-3 minutes depending upon image quality.",
+  ocr: "Running OCR... This could take 5-6 minutes depending upon image quality.",
 };
 const FIELD_LABELS = {
   bank_name: "Bank Name",
