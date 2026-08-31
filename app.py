@@ -49,17 +49,6 @@ def encode_crop(crop):
     return "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode("ascii")
 
 
-def bbox_to_roi(bbox):
-    xs = [p[0] for p in bbox]
-    ys = [p[1] for p in bbox]
-    return {
-        "x": int(min(xs)),
-        "y": int(min(ys)),
-        "width": int(max(xs) - min(xs)),
-        "height": int(max(ys) - min(ys)),
-    }
-
-
 def sse(payload):
     return f"data: {json.dumps(payload)}\n\n"
 
@@ -89,16 +78,16 @@ def run_pipeline_stream(img, debug=False):
 
     yield sse({"stage": "ocr", "status": "active"})
     ocr_start = time.perf_counter()
-    
+
     # For very large images or difficult cheques, OCR can take 1-3 minutes.
     # Yield a substage event during the downscale+detect phase so the UI
     # shows "Detecting text..." instead of just spinning silently for 60+
     # seconds before recognition starts. This is purely UX feedback -
     # no actual progress tracking (PaddleOCR doesn't expose per-box progress).
     yield sse({"ocr_substage": "downscale_detect", "status": "active"})
-    
+
     extracted = ocr_engine.run_ocr(proc_img)
-    
+
     yield sse({"ocr_substage": "downscale_detect", "status": "done"})
     ocr_seconds = time.perf_counter() - ocr_start
     yield sse({"stage": "ocr", "status": "done"})
@@ -123,10 +112,7 @@ def run_pipeline_stream(img, debug=False):
         fields[field] = {
             "label": FIELD_LABELS.get(field, field),
             "text": data["text"],
-            "confidence": float(data["confidence"]),
             "low_confidence": float(data["confidence"]) < 0.8,
-            "roi": bbox_to_roi(data["bbox"]),
-            "bbox": data["bbox"],
             "crop": encode_crop(crop),
         }
         yield sse({"field": field, "status": "done"})
